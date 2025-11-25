@@ -1,0 +1,12 @@
+# 로컬 Streamlit 시크릿(절대 추적 금지)
+.streamlit/
+**/secrets.toml
+
+# Python 캐시 파일
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# macOS 숨김파일
+.DS_Store
