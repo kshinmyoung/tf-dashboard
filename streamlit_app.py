@@ -3,14 +3,10 @@ import pandas as pd
 import gspread
 from google.oauth2.service_account import Credentials
 from datetime import date
-
-# ─────────────────────
-# 0. 기본 설정
-# ─────────────────────
+from io import BytesIO
 
 st.set_page_config(page_title="증빙자료 TF 대시보드", layout="wide")
 
-# 구글 시트 ID는 st.secrets 에서 가져오기
 SPREADSHEET_ID = st.secrets["SPREADSHEET_ID"]
 
 SCOPES = [
@@ -19,13 +15,8 @@ SCOPES = [
 ]
 
 
-# ─────────────────────
-# 1. Google Sheet 연결 함수
-# ─────────────────────
-
 @st.cache_resource
 def get_gsheet_client():
-    """st.secrets에 저장된 서비스 계정으로 gspread 클라이언트 생성"""
     credentials = Credentials.from_service_account_info(
         st.secrets["gcp_service_account"],
         scopes=SCOPES,
@@ -36,28 +27,19 @@ def get_gsheet_client():
 
 @st.cache_data(ttl=60)
 def load_data():
-    """
-    구글 시트에서 '증빙자료'가 들어간 시트를 자동으로 찾아서
-    DataFrame과 Worksheet 객체를 함께 반환
-    (헤더 중복/빈칸도 자동 처리)
-    """
     gc = get_gsheet_client()
     sh = gc.open_by_key(SPREADSHEET_ID)
 
     worksheets = sh.worksheets()
     sheet_titles = [ws.title for ws in worksheets]
-
-    # 화면 상단에 참고용으로 시트 목록 보여주기
     st.caption(f"이 문서 안에 있는 시트들: {sheet_titles}")
 
-    # 제목에 '증빙자료'라는 글자가 들어가는 시트 찾기
     target_ws = None
     for ws in worksheets:
         if "증빙자료" in ws.title:
             target_ws = ws
             break
 
-    # 못 찾으면 첫 번째 시트를 사용 (안전장치)
     if target_ws is None:
         target_ws = worksheets[0]
         st.warning(
@@ -68,16 +50,13 @@ def load_data():
     ws = target_ws
     st.caption(f"현재 사용 중인 시트: '{ws.title}'")
 
-    # 시트 내용 전체 읽기 (헤더 포함)
-    values = ws.get_all_values()  # [[행1], [행2], ...]
+    values = ws.get_all_values()
     if not values:
-        # 시트가 비어 있는 경우
         return pd.DataFrame(), ws
 
     raw_header = values[0]
     data_rows = values[1:]
 
-    # 헤더(1행)에 빈칸/중복이 있으면 자동으로 이름 부여
     header = []
     seen = {}
     for idx, h in enumerate(raw_header):
@@ -87,22 +66,17 @@ def load_data():
         base = name
         count = seen.get(base, 0)
         if count > 0:
-            # 중복 시 "_2", "_3" 등 붙이기
             name = f"{base}_{count+1}"
         seen[base] = count + 1
         header.append(name)
 
     df = pd.DataFrame(data_rows, columns=header)
-
-    # 'Unnamed' 로 시작하는 불필요한 열 제거(혹시 모를 엑셀 잔재)
     df = df.loc[:, ~df.columns.astype(str).str.startswith("Unnamed")]
 
-    # 필수 컬럼이 없으면 기본값으로 추가
     for col in ["담당자", "진행상태", "진행률", "자료링크", "마감일", "비고", "제출자료(예시)"]:
         if col not in df.columns:
             df[col] = ""
 
-    # 진행률 숫자형 정리 (0~100)
     df["진행률"] = (
         pd.to_numeric(df["진행률"], errors="coerce")
         .fillna(0)
@@ -110,45 +84,21 @@ def load_data():
         .astype(int)
     )
 
-    # 마감일 날짜형 정리
     df["마감일"] = pd.to_datetime(df["마감일"], errors="coerce")
 
-    # 내부용 row id (저장 시 어떤 행인지 찾기 위한 키)
     df.reset_index(inplace=True)
     df.rename(columns={"index": "_row_id"}, inplace=True)
 
     return df, ws
 
 
-# ─────────────────────
-# 2. 표시등(빨/노/파) 계산 함수 (복합 규칙 버전)
-# ─────────────────────
-
 def calc_indicator(row: pd.Series) -> str:
-    """
-    표시등 복합 규칙:
-
-    🔴 (위험):
-      - 마감일 지났고 진행률 < 100
-      - 담당자 없음
-      - 진행상태 ∈ ["중단", "이슈", "문제", "보류"]
-      - 진행률 <= 30
-
-    🟡 (주의):
-      - 마감일까지 7일 이하 남았고 미완료
-      - 30 < 진행률 <= 70
-      - 진행상태 ∈ ["지연", "늦음"]
-
-    🔵 (정상):
-      - 위 조건에 해당하지 않으면 모두 파랑
-    """
     today = date.today()
     progress = int(row.get("진행률", 0))
     status = (row.get("진행상태", "") or "").strip()
     owner = (row.get("담당자", "") or "").strip()
     due = row.get("마감일", None)
 
-    # 마감일 처리 (문자열이면 datetime으로 변환 시도)
     if isinstance(due, str):
         try:
             due = pd.to_datetime(due, errors="coerce")
@@ -160,68 +110,263 @@ def calc_indicator(row: pd.Series) -> str:
     else:
         due_date = None
 
-    # -----------------------
-    # 🔴 위험 조건
-    # -----------------------
-    # 1) 마감일 지남 + 미완료
+    # 🔴 위험
     if due_date and due_date < today and progress < 100:
         return "🔴"
-
-    # 2) 담당자 없음
     if owner == "":
         return "🔴"
-
-    # 3) 진행상태가 문제/중단/보류
     danger_states = ["중단", "이슈", "문제", "보류"]
     if status in danger_states:
         return "🔴"
-
-    # 4) 진행률 매우 낮음
     if progress <= 30:
         return "🔴"
 
-    # -----------------------
-    # 🟡 주의 조건
-    # -----------------------
-    # 1) 마감일 임박 (7일 이하) + 미완료
+    # 🟡 주의
     if due_date and 0 <= (due_date - today).days <= 7 and progress < 100:
         return "🟡"
-
-    # 2) 진행률 중간 (30~70)
     if 30 < progress <= 70:
         return "🟡"
-
-    # 3) 진행상태 지연
     warning_states = ["지연", "늦음"]
     if status in warning_states:
         return "🟡"
 
-    # -----------------------
-    # 🔵 정상 조건
-    # -----------------------
+    # 🔵 정상
     return "🔵"
 
 
 # ─────────────────────
-# 3. 메인 앱
+# 공식 보고서 PDF 생성 함수
 # ─────────────────────
+def generate_official_report(df: pd.DataFrame) -> bytes:
+    """
+    A4 세로 공식 보고서 PDF 생성.
+    현재 필터/정렬된 df 기준으로 통계 + 위험/주의 리스트 요약.
+    """
+    from reportlab.lib.pagesizes import A4
+    from reportlab.pdfgen import canvas
+    from reportlab.lib.units import mm
+
+    buffer = BytesIO()
+    c = canvas.Canvas(buffer, pagesize=A4)
+    width, height = A4
+
+    # 여백 설정
+    left_margin = 20 * mm
+    top_margin = height - 20 * mm
+    line_height = 6 * mm
+
+    # 날짜/기본 통계 계산
+    today_str = pd.Timestamp.today().strftime("%Y-%m-%d")
+    total = len(df)
+    done = int((df["진행률"] == 100).sum()) if total > 0 else 0
+    avg_progress = float(df["진행률"].mean()) if total > 0 else 0.0
+
+    red = int((df["표시등"] == "🔴").sum())
+    yellow = int((df["표시등"] == "🟡").sum())
+    blue = int((df["표시등"] == "🔵").sum())
+
+    # 마감일 기준
+    overdue = 0
+    due_soon = 0
+    if "마감일" in df.columns:
+        dates = pd.to_datetime(df["마감일"], errors="coerce")
+        today_ts = pd.Timestamp.today().normalize()
+        overdue = int(((dates < today_ts) & (df["진행률"] < 100)).sum())
+        due_soon = int(
+            (
+                (dates >= today_ts)
+                & (dates <= today_ts + pd.Timedelta(days=7))
+                & (df["진행률"] < 100)
+            ).sum()
+        )
+
+    def write_line(text, x, y, font="Helvetica", size=10, bold=False):
+        c.setFont("Helvetica-Bold" if bold else font, size)
+        c.drawString(x, y, text)
+
+    y = top_margin
+
+    # 제목
+    write_line("대학 인증 증빙자료 준비 현황 공식 보고", left_margin, y, size=15, bold=True)
+    y -= line_height * 1.5
+
+    write_line(f"보고일자: {today_str}", left_margin, y)
+    y -= line_height
+    write_line("작성부서: 혁신지원센터 / TF 운영팀", left_margin, y)
+    y -= line_height * 2
+
+    # 1. 종합 요약
+    write_line("1. 종합 요약 (Executive Summary)", left_margin, y, bold=True)
+    y -= line_height
+
+    if total == 0:
+        write_line("- 현재 집계된 증빙자료 항목이 없습니다.", left_margin + 5 * mm, y)
+        c.showPage()
+        c.save()
+        buffer.seek(0)
+        return buffer.getvalue()
+
+    write_line(f"- 전체 증빙 대상 항목: {total}개", left_margin + 5 * mm, y)
+    y -= line_height
+    write_line(f"- 완료된 항목: {done}개 ({(done/total)*100:.1f}%)", left_margin + 5 * mm, y)
+    y -= line_height
+    write_line(f"- 평균 진행률: {avg_progress:.1f}%", left_margin + 5 * mm, y)
+    y -= line_height
+    write_line(f"- 위험(🔴): {red}개 / 주의(🟡): {yellow}개 / 정상(🔵): {blue}개", left_margin + 5 * mm, y)
+    y -= line_height
+    write_line(f"- 마감 경과(지연) 항목: {overdue}개 / 7일 이내 마감 항목: {due_soon}개", left_margin + 5 * mm, y)
+    y -= line_height * 2
+
+    # 2. 마감 임박 또는 지연 항목
+    write_line("2. 마감 임박 또는 지연 항목 현황", left_margin, y, bold=True)
+    y -= line_height
+
+    if "마감일" in df.columns:
+        dates = pd.to_datetime(df["마감일"], errors="coerce")
+        today_ts = pd.Timestamp.today().normalize()
+        cond = (
+            ((dates < today_ts) & (df["진행률"] < 100))
+            | (
+                (dates >= today_ts)
+                & (dates <= today_ts + pd.Timedelta(days=7))
+                & (df["진행률"] < 100)
+            )
+        )
+        urgent_df = df[cond].copy()
+    else:
+        urgent_df = pd.DataFrame([])
+
+    if urgent_df.empty:
+        write_line("- 마감 임박 또는 지연 항목이 없습니다.", left_margin + 5 * mm, y)
+        y -= line_height * 2
+    else:
+        write_line("- 아래 항목은 마감 7일 이내 또는 기한 경과 미완료 항목입니다.", left_margin + 5 * mm, y)
+        y -= line_height
+
+        max_rows = 20
+        for idx, (_, row) in enumerate(urgent_df.iterrows()):
+            if idx >= max_rows:
+                write_line(f"... 외 {len(urgent_df) - max_rows}건", left_margin + 5 * mm, y)
+                y -= line_height
+                break
+
+            area = row.get("평가영역", "")
+            crit = row.get("평가준거", "")
+            title = row.get("보고서 주요내용", "") or row.get("제출자료(예시)", "")
+            title = str(title)[:40]
+            owner = row.get("담당자", "")
+            prog = row.get("진행률", 0)
+            indicator = row.get("표시등", "")
+            due = row.get("마감일", "")
+
+            if isinstance(due, pd.Timestamp):
+                due_str = due.strftime("%Y-%m-%d")
+            else:
+                try:
+                    due_str = pd.to_datetime(due).strftime("%Y-%m-%d")
+                except Exception:
+                    due_str = ""
+
+            text = f"- [{area}/{crit}] {title} / 담당: {owner} / 마감: {due_str} / {indicator} {prog}%"
+            if y < 30 * mm:
+                c.showPage()
+                y = top_margin
+            write_line(text, left_margin + 5 * mm, y)
+            y -= line_height
+
+        y -= line_height
+
+    # 3. 평가영역별 진행률 요약
+    write_line("3. 평가영역별 진행 현황 요약", left_margin, y, bold=True)
+    y -= line_height
+
+    if "평가영역" in df.columns:
+        area_progress = (
+            df.groupby("평가영역")["진행률"].mean().sort_values(ascending=False)
+        )
+        for area, val in area_progress.items():
+            if y < 30 * mm:
+                c.showPage()
+                y = top_margin
+            write_line(f"- {area}: 평균 진행률 {val:.1f}%", left_margin + 5 * mm, y)
+            y -= line_height
+    else:
+        write_line("- 평가영역 정보가 없습니다.", left_margin + 5 * mm, y)
+        y -= line_height
+
+    y -= line_height
+
+    # 4. 담당자별 진행 현황
+    write_line("4. 담당자별 진행 현황", left_margin, y, bold=True)
+    y -= line_height
+
+    if "담당자" in df.columns:
+        by_owner = df.copy()
+        by_owner["담당자"] = by_owner["담당자"].fillna("").replace("", "미지정")
+        owner_stats = by_owner.groupby("담당자").agg(
+            항목수=("진행률", "count"),
+            완료수=("진행률", lambda s: int((s == 100).sum())),
+            평균진행률=("진행률", "mean"),
+        )
+
+        for owner, row in owner_stats.iterrows():
+            if y < 30 * mm:
+                c.showPage()
+                y = top_margin
+            txt = (
+                f"- {owner}: {row['항목수']}개, "
+                f"완료 {row['완료수']}개, 평균 진행률 {row['평균진행률']:.1f}%"
+            )
+            write_line(txt, left_margin + 5 * mm, y)
+            y -= line_height
+    else:
+        write_line("- 담당자 정보가 없습니다.", left_margin + 5 * mm, y)
+        y -= line_height
+
+    y -= line_height
+
+    # 5. 비고/Action Items (간단 안내)
+    write_line("5. 금주 우선 처리 권장 사항", left_margin, y, bold=True)
+    y -= line_height
+    write_line(
+        "- 🔴(위험) 항목을 우선적으로 점검하고, 제출자료(예시) 및 자료링크를 보완해 주시기 바랍니다.",
+        left_margin + 5 * mm,
+        y,
+    )
+    y -= line_height
+    write_line(
+        "- 마감 7일 이내 항목은 담당부서별로 내부 일정에 반영해 주시기 바랍니다.",
+        left_margin + 5 * mm,
+        y,
+    )
+    y -= line_height
+    write_line(
+        "- 담당자 미지정 항목은 조속히 담당자를 지정하여 관리 공백을 줄여주시기 바랍니다.",
+        left_margin + 5 * mm,
+        y,
+    )
+    y -= line_height * 2
+
+    write_line("보고자: 김신명 (TF 사업단장)", left_margin, y)
+    y -= line_height
+    write_line("승인: ____________________________", left_margin, y)
+
+    c.showPage()
+    c.save()
+    buffer.seek(0)
+    return buffer.getvalue()
+
 
 def main():
     st.title("대학 인증 증빙자료 준비 현황 대시보드")
 
-    # 🔎 데이터 불러오기
     df, ws = load_data()
-
     if df.empty:
         st.warning("증빙자료 시트에 데이터가 없습니다. 구글 시트 내용을 먼저 채워 주세요.")
         return
 
-    # 🟢 표시등 계산
     df["표시등"] = df.apply(calc_indicator, axis=1)
 
-    # ─────────────────────
-    # (A) 상단 신호등 범례
-    # ─────────────────────
     with st.expander("신호등 안내 보기", expanded=True):
         st.markdown(
             """
@@ -243,12 +388,8 @@ def main():
 """
         )
 
-    # ─────────────────────
-    # (B) 사이드바 필터 + 담당자 이름 추천 리스트
-    # ─────────────────────
     st.sidebar.header("필터")
 
-    # 담당자 추천 리스트 (복수 입력은 텍스트로 직접 입력)
     with st.sidebar.expander("담당자 이름 자동 추천(복사해서 사용)", expanded=True):
         st.markdown(
             """
@@ -263,35 +404,31 @@ def main():
 - 이신형  
 - 김신명  
 - 기타  
-            
+
 👉 한 칸에 여러 명 입력할 경우 예시  
 - `김정연, 오한태`  
 - `황보창수 / 이원직 / 기타`
 """
         )
 
-    # 평가영역 필터
     if "평가영역" in df.columns:
         areas = ["전체"] + sorted(df["평가영역"].dropna().unique().tolist())
         selected_area = st.sidebar.selectbox("평가영역", areas, index=0)
     else:
         selected_area = "전체"
 
-    # 평가준거 필터
     if "평가준거" in df.columns:
         kriterias = ["전체"] + sorted(df["평가준거"].dropna().unique().tolist())
         selected_krit = st.sidebar.selectbox("평가준거", kriterias, index=0)
     else:
         selected_krit = "전체"
 
-    # 주무부처 필터
     if "주무부처" in df.columns:
         depts = ["전체"] + sorted(df["주무부처"].dropna().unique().tolist())
         selected_dept = st.sidebar.selectbox("주무부처", depts, index=0)
     else:
         selected_dept = "전체"
 
-    # 담당자 필터 (텍스트 검색 기반)
     if "담당자" in df.columns:
         owners = ["전체"] + sorted(
             set(
@@ -306,7 +443,6 @@ def main():
     else:
         selected_owner = "전체"
 
-    # 필터 적용
     filtered = df.copy()
     if selected_area != "전체" and "평가영역" in df.columns:
         filtered = filtered[filtered["평가영역"] == selected_area]
@@ -317,9 +453,6 @@ def main():
     if selected_owner != "전체" and "담당자" in df.columns:
         filtered = filtered[filtered["담당자"] == selected_owner]
 
-    # ─────────────────────
-    # (C) 위험순 / 마감일순 기본 정렬
-    # ─────────────────────
     indicator_rank = {"🔴": 0, "🟡": 1, "🔵": 2}
     filtered = filtered.copy()
     filtered["표시등_순위"] = filtered["표시등"].map(indicator_rank).fillna(3)
@@ -337,9 +470,6 @@ def main():
             ascending=[True],
         )
 
-    # ─────────────────────
-    # (D) 상단 요약 카드
-    # ─────────────────────
     total = len(filtered_sorted)
     done = (filtered_sorted["진행률"] == 100).sum()
     red = (filtered_sorted["표시등"] == "🔴").sum()
@@ -366,9 +496,6 @@ def main():
 
     st.write("---")
 
-    # ─────────────────────
-    # (E) 간단한 막대그래프 (평가영역별 평균 진행률)
-    # ─────────────────────
     if "평가영역" in filtered_sorted.columns:
         st.subheader("평가영역별 평균 진행률")
         area_progress = (
@@ -383,9 +510,20 @@ def main():
 
     st.write("---")
 
-    # ─────────────────────
-    # (F) 편집 가능한 테이블
-    # ─────────────────────
+    # 📄 공식 보고서 PDF 생성 버튼
+    st.subheader("공식 보고서 생성")
+    st.caption("※ 현재 필터/정렬 상태를 기준으로 A4 세로형 공식 보고서를 PDF로 생성합니다.")
+    if st.button("📄 공식 보고서(PDF) 생성"):
+        pdf_bytes = generate_official_report(filtered_sorted)
+        st.download_button(
+            "📥 다운로드: TF 공식 보고서.pdf",
+            pdf_bytes,
+            file_name="TF_공식보고서.pdf",
+            mime="application/pdf",
+        )
+
+    st.write("---")
+
     st.subheader("증빙자료 리스트 (진행상태/진행률/담당자/비고 등 수정 가능)")
 
     base_cols = [
@@ -404,13 +542,11 @@ def main():
         "비고",
     ]
 
-    # 실제 있는 열만 표시
     show_cols = ["_row_id"] + [c for c in base_cols if c in filtered_sorted.columns]
     view_df = filtered_sorted[show_cols].copy()
 
     col_config = {}
 
-    # row_id 읽기 전용
     if "_row_id" in view_df.columns and hasattr(st.column_config, "NumberColumn"):
         col_config["_row_id"] = st.column_config.NumberColumn(
             "row_id",
@@ -418,7 +554,6 @@ def main():
             width="small",
         )
 
-    # 표시등 읽기 전용
     if "표시등" in view_df.columns and hasattr(st.column_config, "TextColumn"):
         col_config["표시등"] = st.column_config.TextColumn(
             "표시등",
@@ -426,7 +561,6 @@ def main():
             width="small",
         )
 
-    # 진행상태 드롭다운
     status_options = ["미착수", "진행중", "완료", "보류", "지연"]
     if hasattr(st.column_config, "SelectboxColumn") and "진행상태" in view_df.columns:
         col_config["진행상태"] = st.column_config.SelectboxColumn(
@@ -435,7 +569,6 @@ def main():
             help="진행상태를 선택하세요.",
         )
 
-    # 진행률 숫자 입력
     if hasattr(st.column_config, "NumberColumn") and "진행률" in view_df.columns:
         col_config["진행률"] = st.column_config.NumberColumn(
             "진행률(%)",
@@ -445,13 +578,9 @@ def main():
             help="0~100 사이의 정수를 입력하세요.",
         )
 
-    # 마감일 DateColumn
     if hasattr(st.column_config, "DateColumn") and "마감일" in view_df.columns:
         col_config["마감일"] = st.column_config.DateColumn("마감일")
 
-    # 담당자는 자유 텍스트 입력 (여러 명 입력 가능) → 별도 column_config 필요 없음
-
-    # 편집 불가능한 열 목록 (제출자료(예시)는 이제 수정 가능하므로 제외)
     disabled_cols = [
         "표시등",
         "평가영역",
@@ -476,16 +605,11 @@ def main():
         "반드시 아래 '저장' 버튼을 눌러야 구글 시트에 반영됩니다."
     )
 
-    # ─────────────────────
-    # (G) 저장 버튼 (ws.clear() 제거, ws.update()만 사용)
-    # ─────────────────────
     if st.button("변경 내용 구글 시트에 저장하기"):
-        updated = df.copy()  # 전체 데이터 기준으로 업데이트
+        updated = df.copy()
 
-        # 편집 가능 컬럼 정의
         editable_cols = ["담당자", "진행상태", "진행률", "자료링크", "마감일", "비고", "제출자료(예시)"]
 
-        # edited_df의 변경 사항을 _row_id 기준으로 반영
         for _, row in edited_df.iterrows():
             rid = int(row["_row_id"])
             mask = updated["_row_id"] == rid
@@ -493,7 +617,6 @@ def main():
                 if col in updated.columns and col in row.index:
                     updated.loc[mask, col] = row[col]
 
-        # 진행률 다시 숫자(0~100)로 정리
         if "진행률" in updated.columns:
             updated["진행률"] = (
                 pd.to_numeric(updated["진행률"], errors="coerce")
@@ -502,7 +625,6 @@ def main():
                 .astype(int)
             )
 
-        # 마감일을 문자열(YYYY-MM-DD)로 변환
         if "마감일" in updated.columns:
             updated["마감일"] = (
                 pd.to_datetime(updated["마감일"], errors="coerce")
@@ -510,15 +632,13 @@ def main():
                 .fillna("")
             )
 
-        # 내부용 컬럼/표시등 컬럼 삭제 후 저장용 DataFrame 생성
         drop_cols = ["_row_id", "표시등", "표시등_순위"]
         save_df = updated.drop(columns=drop_cols, errors="ignore")
 
-        # 🔥 ws.clear() 대신 values.update 로 전체 범위 덮어쓰기
         data_to_write = [save_df.columns.tolist()] + save_df.astype(str).values.tolist()
         ws.update(data_to_write)
 
-        st.cache_data.clear()  # 캐시 초기화
+        st.cache_data.clear()
         st.success("구글 시트에 저장되었습니다! 화면을 새로고침합니다.")
 
         try:
