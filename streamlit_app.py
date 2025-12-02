@@ -98,7 +98,7 @@ def load_data():
     df = df.loc[:, ~df.columns.astype(str).str.startswith("Unnamed")]
 
     # 필수 컬럼이 없으면 기본값으로 추가
-    for col in ["담당자", "진행상태", "진행률", "자료링크", "마감일", "비고"]:
+    for col in ["담당자", "진행상태", "진행률", "자료링크", "마감일", "비고", "제출자료(예시)"]:
         if col not in df.columns:
             df[col] = ""
 
@@ -290,12 +290,10 @@ def main():
     # ─────────────────────
     # (C) 위험순 / 마감일순 기본 정렬
     # ─────────────────────
-    # 표시등에 대한 정렬 순서 매핑
     indicator_rank = {"🔴": 0, "🟡": 1, "🔵": 2}
     filtered = filtered.copy()
     filtered["표시등_순위"] = filtered["표시등"].map(indicator_rank).fillna(3)
 
-    # 마감일 정렬을 위해 datetime 보장
     if "마감일" in filtered.columns:
         filtered["마감일"] = pd.to_datetime(filtered["마감일"], errors="coerce")
         filtered_sorted = filtered.sort_values(
@@ -309,10 +307,6 @@ def main():
             ascending=[True],
         )
 
-    # 정렬용 임시 컬럼은 이후 표시용에서 제거
-    # (하지만 내부 업데이트용 DataFrame에는 남겨둬도 문제 없음)
-    # ─────────────────────
-
     # ─────────────────────
     # (D) 상단 요약 카드
     # ─────────────────────
@@ -321,7 +315,6 @@ def main():
     red = (filtered_sorted["표시등"] == "🔴").sum()
     yellow = (filtered_sorted["표시등"] == "🟡").sum()
 
-    # 지연(마감일 경과 미완료) 계산
     if "마감일" in filtered_sorted.columns:
         dates = pd.to_datetime(filtered_sorted["마감일"], errors="coerce")
         today_ts = pd.Timestamp.today().normalize()
@@ -353,7 +346,6 @@ def main():
             .mean()
             .sort_values(ascending=False)
         )
-        # 인덱스를 컬럼으로 바꾸어 bar_chart에 전달
         chart_df = area_progress.reset_index()
         chart_df = chart_df.rename(columns={"평가영역": "평가영역", "진행률": "평균 진행률"})
         chart_df = chart_df.set_index("평가영역")
@@ -386,10 +378,9 @@ def main():
     show_cols = ["_row_id"] + [c for c in base_cols if c in filtered_sorted.columns]
     view_df = filtered_sorted[show_cols].copy()
 
-    # column_config (진행상태 드롭다운, 진행률 숫자 입력 등)
     col_config = {}
 
-    # 내부 row_id는 수정 불가
+    # row_id 읽기 전용
     if "_row_id" in view_df.columns and hasattr(st.column_config, "NumberColumn"):
         col_config["_row_id"] = st.column_config.NumberColumn(
             "row_id",
@@ -405,7 +396,7 @@ def main():
             width="small",
         )
 
-    # 진행상태: SelectboxColumn 지원 시 드롭다운으로
+    # 진행상태 드롭다운
     status_options = ["미착수", "진행중", "완료", "보류", "지연"]
     if hasattr(st.column_config, "SelectboxColumn") and "진행상태" in view_df.columns:
         col_config["진행상태"] = st.column_config.SelectboxColumn(
@@ -414,7 +405,7 @@ def main():
             help="진행상태를 선택하세요.",
         )
 
-    # 진행률: NumberColumn으로 0~100 정수 입력
+    # 진행률 숫자 입력
     if hasattr(st.column_config, "NumberColumn") and "진행률" in view_df.columns:
         col_config["진행률"] = st.column_config.NumberColumn(
             "진행률(%)",
@@ -424,17 +415,30 @@ def main():
             help="0~100 사이의 정수를 입력하세요.",
         )
 
-    # 마감일: DateColumn 사용 (지원 시)
+    # 마감일 DateColumn
     if hasattr(st.column_config, "DateColumn") and "마감일" in view_df.columns:
         col_config["마감일"] = st.column_config.DateColumn("마감일")
 
-    # 편집 불가능한 열 목록
+    # 담당자 드롭다운: 현재 시트에 등장하는 담당자 목록 + 빈 값
+    if "담당자" in view_df.columns and hasattr(st.column_config, "SelectboxColumn"):
+        owner_options = sorted(
+            set(
+                [o for o in df["담당자"].dropna().unique().tolist() if str(o).strip() != ""]
+            )
+        )
+        owner_options = [""] + owner_options  # 빈 값 허용
+        col_config["담당자"] = st.column_config.SelectboxColumn(
+            "담당자",
+            options=owner_options,
+            help="담당자를 선택하세요.",
+        )
+
+    # 편집 불가능한 열 목록 (제출자료(예시)는 이제 수정 가능하므로 제외)
     disabled_cols = [
         "표시등",
         "평가영역",
         "평가준거",
         "보고서 주요내용",
-        "제출자료(예시)",
         "구비서류",
         "주무부처",
     ]
@@ -450,7 +454,7 @@ def main():
     )
 
     st.info(
-        "각 셀(진행상태/진행률/담당자/자료링크/마감일/비고 등)을 수정한 후, "
+        "각 셀(진행상태/진행률/담당자/자료링크/제출자료(예시)/마감일/비고 등)을 수정한 후, "
         "반드시 아래 '저장' 버튼을 눌러야 구글 시트에 반영됩니다."
     )
 
@@ -460,7 +464,8 @@ def main():
     if st.button("변경 내용 구글 시트에 저장하기"):
         updated = df.copy()  # 전체 데이터 기준으로 업데이트
 
-        editable_cols = ["담당자", "진행상태", "진행률", "자료링크", "마감일", "비고"]
+        # 🟢 여기서부터 편집 가능 컬럼 정의 (제출자료(예시) 포함)
+        editable_cols = ["담당자", "진행상태", "진행률", "자료링크", "마감일", "비고", "제출자료(예시)"]
 
         # edited_df의 변경 사항을 _row_id 기준으로 반영
         for _, row in edited_df.iterrows():
@@ -479,7 +484,7 @@ def main():
                 .astype(int)
             )
 
-        # 마감일을 문자열(YYYY-MM-DD)로 변환 (빈 값은 "")
+        # 마감일을 문자열(YYYY-MM-DD)로 변환
         if "마감일" in updated.columns:
             updated["마감일"] = (
                 pd.to_datetime(updated["마감일"], errors="coerce")
@@ -488,18 +493,22 @@ def main():
             )
 
         # 내부용 컬럼/표시등 컬럼 삭제 후 저장용 DataFrame 생성
-        save_df = updated.drop(
-            columns=["_row_id", "표시등", "표시등_순위"] if "표시등_순위" in updated.columns else ["_row_id", "표시등"],
-            errors="ignore",
-        )
+        drop_cols = ["_row_id", "표시등", "표시등_순위"]
+        save_df = updated.drop(columns=drop_cols, errors="ignore")
 
         # 구글 시트에 전체 덮어쓰기
         ws.clear()
         ws.append_row(list(save_df.columns))  # 헤더
         ws.append_rows(save_df.astype(str).values.tolist())
 
-        st.success("구글 시트에 저장되었습니다! (페이지를 새로고침하면 표시등이 갱신됩니다.)")
         st.cache_data.clear()  # 캐시 초기화
+        st.success("구글 시트에 저장되었습니다! 화면을 새로고침합니다.")
+
+        # 저장 후 새로고침해서 표시등/정렬/그래프를 최신 상태로
+        try:
+            st.rerun()
+        except Exception:
+            st.experimental_rerun()
 
 
 if __name__ == "__main__":
