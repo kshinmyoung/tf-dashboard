@@ -244,9 +244,31 @@ def main():
         )
 
     # ─────────────────────
-    # (B) 사이드바 필터
+    # (B) 사이드바 필터 + 담당자 이름 추천 리스트
     # ─────────────────────
     st.sidebar.header("필터")
+
+    # 담당자 추천 리스트 (복수 입력은 텍스트로 직접 입력)
+    with st.sidebar.expander("담당자 이름 자동 추천(복사해서 사용)", expanded=True):
+        st.markdown(
+            """
+- 김정연  
+- 오한태  
+- 황보창수  
+- 이원직  
+- 임규혜  
+- 황혜숙  
+- 박예린  
+- 박재훈  
+- 이신형  
+- 김신명  
+- 기타  
+            
+👉 한 칸에 여러 명 입력할 경우 예시  
+- `김정연, 오한태`  
+- `황보창수 / 이원직 / 기타`
+"""
+        )
 
     # 평가영역 필터
     if "평가영역" in df.columns:
@@ -269,10 +291,18 @@ def main():
     else:
         selected_dept = "전체"
 
-    # 담당자 필터
+    # 담당자 필터 (텍스트 검색 기반)
     if "담당자" in df.columns:
-        owners = ["전체"] + sorted(df["담당자"].dropna().unique().tolist())
-        selected_owner = st.sidebar.selectbox("담당자", owners, index=0)
+        owners = ["전체"] + sorted(
+            set(
+                [
+                    o.strip()
+                    for o in df["담당자"].dropna().tolist()
+                    if str(o).strip() != ""
+                ]
+            )
+        )
+        selected_owner = st.sidebar.selectbox("담당자 (정확히 일치)", owners, index=0)
     else:
         selected_owner = "전체"
 
@@ -419,19 +449,7 @@ def main():
     if hasattr(st.column_config, "DateColumn") and "마감일" in view_df.columns:
         col_config["마감일"] = st.column_config.DateColumn("마감일")
 
-    # 담당자 드롭다운: 현재 시트에 등장하는 담당자 목록 + 빈 값
-    if "담당자" in view_df.columns and hasattr(st.column_config, "SelectboxColumn"):
-        owner_options = sorted(
-            set(
-                [o for o in df["담당자"].dropna().unique().tolist() if str(o).strip() != ""]
-            )
-        )
-        owner_options = [""] + owner_options  # 빈 값 허용
-        col_config["담당자"] = st.column_config.SelectboxColumn(
-            "담당자",
-            options=owner_options,
-            help="담당자를 선택하세요.",
-        )
+    # 담당자는 자유 텍스트 입력 (여러 명 입력 가능) → 별도 column_config 필요 없음
 
     # 편집 불가능한 열 목록 (제출자료(예시)는 이제 수정 가능하므로 제외)
     disabled_cols = [
@@ -459,12 +477,12 @@ def main():
     )
 
     # ─────────────────────
-    # (G) 저장 버튼
+    # (G) 저장 버튼 (ws.clear() 제거, ws.update()만 사용)
     # ─────────────────────
     if st.button("변경 내용 구글 시트에 저장하기"):
         updated = df.copy()  # 전체 데이터 기준으로 업데이트
 
-        # 🟢 여기서부터 편집 가능 컬럼 정의 (제출자료(예시) 포함)
+        # 편집 가능 컬럼 정의
         editable_cols = ["담당자", "진행상태", "진행률", "자료링크", "마감일", "비고", "제출자료(예시)"]
 
         # edited_df의 변경 사항을 _row_id 기준으로 반영
@@ -496,15 +514,13 @@ def main():
         drop_cols = ["_row_id", "표시등", "표시등_순위"]
         save_df = updated.drop(columns=drop_cols, errors="ignore")
 
-        # 구글 시트에 전체 덮어쓰기
-        ws.clear()
-        ws.append_row(list(save_df.columns))  # 헤더
-        ws.append_rows(save_df.astype(str).values.tolist())
+        # 🔥 ws.clear() 대신 values.update 로 전체 범위 덮어쓰기
+        data_to_write = [save_df.columns.tolist()] + save_df.astype(str).values.tolist()
+        ws.update(data_to_write)
 
         st.cache_data.clear()  # 캐시 초기화
         st.success("구글 시트에 저장되었습니다! 화면을 새로고침합니다.")
 
-        # 저장 후 새로고침해서 표시등/정렬/그래프를 최신 상태로
         try:
             st.rerun()
         except Exception:
