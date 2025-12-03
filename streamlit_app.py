@@ -511,7 +511,7 @@ def main():
         if len(ind_df) > 0:
             chart = (
                 alt.Chart(ind_df)
-                .mark_bar(radiusTopLeft=4, radiusTopRight=4)
+                .mark_bar()
                 .encode(
                     x=alt.X("표시등:N", title="신호등"),
                     y=alt.Y("개수:Q", title="항목 수"),
@@ -545,7 +545,7 @@ def main():
 
             area_chart = (
                 alt.Chart(area_progress)
-                .mark_bar(radiusTopLeft=4, radiusTopRight=4)
+                .mark_bar()
                 .encode(
                     x=alt.X("평균진행률:Q", title="평균 진행률(%)"),
                     y=alt.Y("평가영역:N", sort="-x", title="평가영역"),
@@ -580,7 +580,7 @@ def main():
             st.markdown("**담당자별 평균 진행률**")
             owner_chart = (
                 alt.Chart(owner_stats)
-                .mark_bar(radiusTopLeft=4, radiusTopRight=4)
+                .mark_bar()
                 .encode(
                     x=alt.X("평균진행률:Q", title="평균 진행률(%)"),
                     y=alt.Y("담당자:N", sort="-x", title="담당자"),
