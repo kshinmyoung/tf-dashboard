@@ -49,7 +49,6 @@ def load_data():
     sh = gc.open_by_key(SPREADSHEET_ID)
 
     worksheets = sh.worksheets()
-    sheet_titles = [ws.title for ws in worksheets]
 
     # '증빙자료' 문자열 포함 시트 우선 사용, 없으면 첫 번째 시트 사용
     target_ws = None
@@ -338,7 +337,17 @@ def main():
         "실제 수정(담당자, 진행률, 마감일 등)은 **구글 스프레드시트에서 직접** 해 주세요."
     )
 
-    df = load_data()
+    # 데이터 로딩 시 에러를 잡아서 사용자에게 보여주기
+    try:
+        df = load_data()
+    except Exception as e:
+        st.error(
+            "구글 시트 데이터를 불러오는 중 오류가 발생했습니다.\n\n"
+            "• `SPREADSHEET_ID` 또는 `gcp_service_account` 설정을 다시 확인해 주세요.\n\n"
+            f"오류 메시지: {e}"
+        )
+        st.stop()
+
     if df.empty:
         st.warning("증빙자료 시트에 데이터가 없습니다. 구글 시트 내용을 먼저 채워 주세요.")
         return
@@ -485,7 +494,7 @@ def main():
         ["📌 개요", "📚 평가영역별", "👤 담당자별", "📋 상세 목록"]
     )
 
-    # ───── 탭 1: 개요 (신호등 분포 + 전체 진행률 추세) ─────
+    # ───── 탭 1: 개요 (신호등 분포 + 전체 진행률 요약) ─────
     with tab_overview:
         st.subheader("신호등 분포")
 
@@ -510,7 +519,7 @@ def main():
                 )
                 .properties(height=250)
             )
-            st.altair_chart(chart, use_container_width=True)
+            st.altair_chart(chart, width="stretch")
         else:
             st.info("표시할 항목이 없습니다. 사이드바 필터를 조정해 보세요.")
 
@@ -544,7 +553,7 @@ def main():
                 )
                 .properties(height=300)
             )
-            st.altair_chart(area_chart, use_container_width=True)
+            st.altair_chart(area_chart, width="stretch")
         else:
             st.info("평가영역 정보가 없거나, 필터 결과가 비어 있습니다.")
 
@@ -579,13 +588,13 @@ def main():
                 )
                 .properties(height=300)
             )
-            st.altair_chart(owner_chart, use_container_width=True)
+            st.altair_chart(owner_chart, width="stretch")
 
             # 표도 같이 보여주기
             st.markdown("**담당자별 요약 표**")
             st.dataframe(
                 owner_stats.sort_values("평균진행률", ascending=False),
-                use_container_width=True,
+                width="stretch",
             )
         else:
             st.info("담당자 정보가 없거나, 필터 결과가 비어 있습니다.")
@@ -615,9 +624,10 @@ def main():
 
         # 날짜 포맷 보기 좋게
         if "마감일" in df_show.columns:
+            df_show["마감일"] = pd.to_datetime(df_show["마감일"], errors="coerce")
             df_show["마감일"] = df_show["마감일"].dt.strftime("%Y-%m-%d")
 
-        st.dataframe(df_show, use_container_width=True, height=450)
+        st.dataframe(df_show, width="stretch", height=450)
 
     st.write("---")
 
