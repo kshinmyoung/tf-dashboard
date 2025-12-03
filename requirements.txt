@@ -1,6 +1,8 @@
-streamlit
-pandas
-gspread
-google-auth
-google-auth-httplib2
-google-auth-oauthlib
+streamlit==1.32.2
+pandas==2.2.2
+
+gspread==6.1.2
+google-auth==2.35.0
+google-auth-oauthlib==1.2.1
+google-auth-httplib2==0.2.0
+
